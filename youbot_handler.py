@@ -1,4 +1,5 @@
 from vrep import VRep
+from Astar import astar
 from vrep.const import *
 from youbot import YouBot
 from time import sleep
@@ -33,107 +34,187 @@ def rel2abs(X_rel, Y_rel, youbot_pos, angle):
     return X_abs, Y_abs
 
 class YoubotHandler:
-    def __init__():
-        pass
+    def __init__(self,vrep):
+        # This will only work in "continuous remote API server service". 
+        # See http://www.v-rep.eu/helpFiles/en/remoteApiServerSide.htm
+        self.vrep = vrep
+        self.vrep.simxStartSimulation(simx_opmode_oneshot_wait)
+        self.init_youbot()
+        # Let a few cycles pass to make sure there's a value waiting for us next time we try to get a 
+        # joint angle or the robot pose with the simx_opmode_buffer option.
+        sleep(.2)
+        self.init_position_and_constants()
+    
+    def init_youbot(self):
+        # Retrieve all handles, and stream arm and wheel joints, the robot's pose, the Hokuyo, and the 
+        # arm tip pose. The tip corresponds to the point between the two tongs of the gripper (for 
+        # more details, see later or in the file focused/youbot_arm.m). 
+        self.youbot = YouBot(self.vrep)
+        self.youbot.examples(self.vrep)
+        self.youbot.hokuyo_init(self.vrep)
+    
+    def init_position_and_constants(self):
+        # Minimum and maximum angles for all joints. Only useful to implement custom IK. 
+        self.arm_joint_ranges = [-2.9496064186096, 2.9496064186096
+                            -1.5707963705063, 1.308996796608
+                            -2.2863812446594, 2.2863812446594
+                            -1.7802357673645, 1.7802357673645
+                            -1.5707963705063, 1.5707963705063]
+
+        # Definition of the starting pose of the arm (the angle to impose at each joint to be in the 
+        # rest position).
+        self.starting_joints = np.deg2rad(np.array([0, 30.91, 52.42, 72.68, 0]))
+
+        ## Preset values for the demo. 
+        print('Starting robot')
+    
+        # Define the preset pickup pose for this demo. 
+        self.pickup_joints = np.deg2rad(np.array([90, 19.6, 113, -41, 0]))
+
+        # Parameters for controlling the youBot's wheels: at each iteration, those values will be set 
+        # for the wheels.
+        self.forw_back_vel = 0       # Move straight ahead. 
+        self.right_vel = 0           # Go sideways. 
+        self.rotate_right_vel = 0    # Rotate. 
+        self.prev_orientation = 0    # Previous angle to goal (easy way to have a condition on the robot's 
+                                     # angular speed). 
+        self.prev_position = 0       # Previous distance to goal (easy way to have a condition on the 
+                                     # robot's speed). 
+
+        # Set the arm to its starting configuration. 
+        self.vrep.simxPauseCommunication(True) 
+        for arm_joint, starting_joint in zip(self.youbot.arm_joints, self.starting_joints):
+            self.vrep.simxSetJointTargetPosition(arm_joint, starting_joint)
+        self.vrep.simxPauseCommunication(False) 
+    
+        # Retrieve the position of the gripper. 
+        self.home_gripper_position = np.asarray(self.vrep.simxGetObjectPosition(self.youbot.ptip, self.youbot.arm_ref, 
+                                                                      simx_opmode_buffer))
+
+
+    def rel2abs(self, X_rel, Y_rel, youbot_pos, angle):
+        X_rel = np.array(X_rel)
+        Y_rel = np.array(Y_rel)
+        X_abs = X_rel * np.cos(angle) - Y_rel * np.sin(angle)
+        Y_abs = X_rel * np.sin(angle) + Y_rel * np.cos(angle)
+        X_abs += youbot_pos[0]
+        Y_abs += youbot_pos[1]
+        return X_abs, Y_abs
+
+def print_empty_space_on_map(pts, contacts, X_rel, Y_rel, map_arr):
+    # Create a 2D mesh of points, stored in the vectors X and Y. This will be used to 
+    # display 
+    # the area the robot can see, by selecting the points within this mesh that are within 
+    # the visibility range.
+    mesh_time = timer()
+    x, y = np.meshgrid(np.arange(-5, 5, 1.0/map_ppm), np.arange(-5, 5, 1.0/map_ppm))
+    #print("Meshgrid time:", timer() - mesh_time, timer()-start_time)
+    x, y = x.reshape(-1), y.reshape(-1)
+
+    # Select the points in the mesh [X, Y] that are visible, as returned by the Hokuyo (it 
+    # returns the area that is visible, but the visualisation draws a series of points 
+    # that are within this visible area). 
+ 
+    poly_time = timer()
+    path = PolygonPath(list(zip(X_rel,Y_rel)))
+    inside = path.contains_points(list(zip(x, y)))
+
+    # Plot those points. Green dots: the visible area for the Hokuyo. Red starts: the 
+    # obstacles. Red lines: the visibility range from the Hokuyo sensor. The youBot is 
+    # indicated with two dots: the blue one corresponds to the rear, the red one to the 
+    # Hokuyo sensor position. 
+    # the points inside the laser range and that are not obstacles
+    XY_inside = rel2abs(x[inside], y[inside], youbot_pos, youbot_euler[2])
+    #sensor_ax.plot(*XY_inside, '.g')
+    inside_timer = timer()
+    for i in range(len(XY_inside[0])):
+        x = int((XY_inside[0][i]) * map_ppm - map_offset[0])
+        y = int((XY_inside[1][i]) * map_ppm - map_offset[1])
+        map_arr[x][y] = 255
+    #print("Inside timer", timer() - inside_timer, start_time - timer())
+
+# Return the next point to go to in order to explore
+def point2explore(map_arr, youbot_pos):
+    explore_map = np.zeros(map_arr.shape, dtype='uint8')
+    unexplored_map = np.where(map_arr == 127, 255, 0).astype('uint8')
+    #cv2.imshow('unexplored', unexplored_map)
+    #map_arr = np.ones((4*array_side_len+1, 4*array_side_len+1), dtype="uint8") * 127
+    print(youbot_pos)
+    pos_x, pos_y = youbot_pos[:2]
+    pos_x = int(pos_x)
+    pos_y = int(pos_y)
+    print(pos_x, pos_y)
+    explore_map[pos_x, pos_y] = 255
+    walls_arr = np.where(map_arr == 0, 255, 0).astype('uint8')
+    kernel = np.ones((3,3), np.uint8)
+
+    # Prevent small holes in the walls
+    ## walls_arr = cv2.dilate(walls_arr, kernel, iterations=2)
+    explored_arr = np.where(map_arr == 255, 255, 0)
+    #cv2.imshow("walls_arr", walls_arr)
+    
+
+    while True:
+        explore_map = cv2.dilate(explore_map, kernel, iterations=1)
+        explore_map = np.where(walls_arr == 255, 0, explore_map)
+    
+        to_explore = np.where(explore_map == 255, unexplored_map, 0)
+        point2exp = list(zip(*np.nonzero(to_explore)))
+        if len(point2exp) > 0:
+            return point2exp[0]
+
+    # Attention need to check that the previous explore_map is different that the current one, other wise the search is over and the exploration is also over.
+    """
+    dilate explore_map, remove all points that are on walls, then compare with explored, if a point is on a non explored place, return the point, else restart the process
+    """
+
+def path2point(youbot_pos, map_arr, point):
+    walls_arr = np.where(map_arr == 0, 1, 0).astype('uint8')
+    kernel = np.ones((3,3), dtype='uint8')
+    walls_arr = cv2.dilate(walls_arr, kernel, iterations=0)
+    #ox, oy = np.nonzero(walls_arr)
+    pos_x, pos_y = youbot_pos[:2]
+    pos_x = int(pos_x * map_ppm - map_offset[0])
+    pos_y = int(pos_y * map_ppm - map_offset[1])
+    #print(pos_x, pos_y, ox, oy)
+    p = astar(walls_arr, (pos_x, pos_y), point)
+    print("Path is:", p)
+    return p
 
 if __name__ == '__main__':
-#    cv2.imshow('test', (np.ones((100, 100))*220).astype("uint8"))
-#    cv2.waitKey(0)
-#        pass
-
     ## Initiate the connection to the simulator. 
     print('Program started')
     VRep.simxFinish(-1)
     vrep = VRep('127.0.0.1', 19997, True, True, 2000, 5)
     print('Connection %d to the remote API server open.\n' % vrep.clientID)
-
-    # This will only work in "continuous remote API server service". 
-    # See http://www.v-rep.eu/helpFiles/en/remoteApiServerSide.htm
-    vrep.simxStartSimulation(simx_opmode_oneshot_wait)
     
+    # The YoubotHandler is a class wraping all the lower level acces and allow to only have controls in the code. Making it clearer.
+    youbot_handler = YoubotHandler(vrep)
+
     # Stop the simulation whenever exiting (e.g. ctrl-C)
     @atexit.register
     def stop_simulation():
         vrep.simxStopSimulation(simx_opmode_oneshot_wait)
         vrep.simxFinish(vrep.clientID)
 
-    # Retrieve all handles, and stream arm and wheel joints, the robot's pose, the Hokuyo, and the 
-    # arm tip pose. The tip corresponds to the point between the two tongs of the gripper (for 
-    # more details, see later or in the file focused/youbot_arm.m). 
-    youbot = YouBot(vrep)
-    youbot.examples(vrep)
-    youbot.hokuyo_init(vrep)
-    
-    # Let a few cycles pass to make sure there's a value waiting for us next time we try to get a 
-    # joint angle or the robot pose with the simx_opmode_buffer option.
-    sleep(.2)
-
     ## Youbot constants
     # The time step the simulator is using (your code should run close to it). 
-    timestep = .1
-
-    # Minimum and maximum angles for all joints. Only useful to implement custom IK. 
-    arm_joint_ranges = [-2.9496064186096, 2.9496064186096
-                        -1.5707963705063, 1.308996796608
-                        -2.2863812446594, 2.2863812446594
-                        -1.7802357673645, 1.7802357673645
-                        -1.5707963705063, 1.5707963705063]
-
-    # Definition of the starting pose of the arm (the angle to impose at each joint to be in the 
-    # rest position).
-    starting_joints = np.deg2rad(np.array([0, 30.91, 52.42, 72.68, 0]))
-
-    ## Preset values for the demo. 
-    print('Starting robot')
-    
-    # Define the preset pickup pose for this demo. 
-    pickup_joints = np.deg2rad(np.array([90, 19.6, 113, -41, 0]))
-
-    # Parameters for controlling the youBot's wheels: at each iteration, those values will be set 
-    # for the wheels.
-    forw_back_vel = 0       # Move straight ahead. 
-    right_vel = 0           # Go sideways. 
-    rotate_right_vel = 0    # Rotate. 
-    prev_orientation = 0    # Previous angle to goal (easy way to have a condition on the robot's 
-                            # angular speed). 
-    prev_position = 0       # Previous distance to goal (easy way to have a condition on the 
-                            # robot's speed). 
-
-    # Set the arm to its starting configuration. 
-    vrep.simxPauseCommunication(True) 
-    for arm_joint, starting_joint in zip(youbot.arm_joints, starting_joints):
-        vrep.simxSetJointTargetPosition(arm_joint, starting_joint)
-    vrep.simxPauseCommunication(False) 
+    timestep = .05
+    initial_rotation = False
 
     # Initialise the plot. 
     plot_data = True
-    if plot_data:
-        # Prepare the plot area to receive three plots: what the Hokuyo sees at the top (2D map), 
-        # the point cloud and the image of what is in front of the robot at the bottom.
-        plt.ion()   # Enable interactive mode
-        sensor_ax = plt.subplot(211)    # type: plt.Axes
-        camera_ax = plt.subplot(224)    # type: plt.Axes
-        pt_cloud_ax = plt.subplot(223, projection='3d') # type: plt.Axes
-        canvas = plt.gcf().canvas
-        plt.draw()
-
-    # Make sure everything is settled before we start. (is this necessary?)
-    # sleep(2)
-
-    # Retrieve the position of the gripper. 
-    home_gripper_position = np.asarray(vrep.simxGetObjectPosition(youbot.ptip, youbot.arm_ref, 
-                                                                  simx_opmode_buffer))
 
     # Initialise the map.
     map_len = 10 # meters
     map_ppm = 8 # map_points_per_meters = 1
     array_side_len =  map_len * map_ppm
-    youbot_pos = vrep.simxGetObjectPosition(youbot.ref, -1, simx_opmode_buffer)
+    youbot_pos = youbot_handler.vrep.simxGetObjectPosition(youbot_handler.youbot.ref, -1, simx_opmode_buffer)
     # Compute the offset between the starting position of the robot and the center of the map array 
     map_offset = np.array(youbot_pos[:2]) * map_ppm - np.asarray([2*array_side_len, 2*array_side_len])
     # 4*len+1 because we don't know where we start in the env, so the robot will start in the middle of the array
     map_arr = np.ones((4*array_side_len+1, 4*array_side_len+1), dtype="uint8") * 127
-    cv2.imshow('RIP35', map_arr)
+    cv2.imshow('MAP', map_arr)
 
     # List of exploring movements
     moves = [('r', np.pi), ('f', 2, -5.25), ('r', np.pi/2), ('f', 2, 0), ('r', 0), ('f', 5, 0)]
@@ -142,6 +223,7 @@ if __name__ == '__main__':
     # Initialise the state machine. 
     fsm = 'rotate'
     fsm = 'test-move-init'
+    fsm = 'explore-init'
 
     ## Start the demo. 
     while True:
@@ -154,8 +236,8 @@ if __name__ == '__main__':
             raise Exception('Lost connection to remote API.')
 
         # Get the position and the orientation of the robot. 
-        youbot_pos = vrep.simxGetObjectPosition(youbot.ref, -1, simx_opmode_buffer)
-        youbot_euler = vrep.simxGetObjectOrientation(youbot.ref, -1, simx_opmode_buffer)
+        youbot_pos = youbot_handler.vrep.simxGetObjectPosition(youbot_handler.youbot.ref, -1, simx_opmode_buffer)
+        youbot_euler = youbot_handler.vrep.simxGetObjectOrientation(youbot_handler.youbot.ref, -1, simx_opmode_buffer)
         # The angle from euler is referenced from y axis so substracting pi/2 make it referenced from x axis
         youbot_angle = youbot_euler[2] - np.pi/2
         angle = -np.pi / 2
@@ -169,45 +251,10 @@ if __name__ == '__main__':
             # for each point, if it corresponds to an obstacle (the ray the Hokuyo sent was 
             # interrupted by an obstacle, and was not allowed to go to infinity without being 
             # stopped). 
-            pts, contacts = youbot.hokuyo_read(vrep, simx_opmode_buffer)
-            X_rel = [youbot.hokuyo1_pos[0], *pts[0, :], youbot.hokuyo2_pos[0]]
-            Y_rel = [youbot.hokuyo1_pos[1], *pts[1, :], youbot.hokuyo2_pos[1]]
-            def print_empty_space_on_map(pts, contacts, X_rel, Y_rel, map_arr):
-                # Create a 2D mesh of points, stored in the vectors X and Y. This will be used to 
-                # display 
-                # the area the robot can see, by selecting the points within this mesh that are within 
-                # the visibility range.
-                mesh_time = timer()
-                x, y = np.meshgrid(np.arange(-5, 5, 1.0/map_ppm), np.arange(-5, 5, 1.0/map_ppm))
-                #print("Meshgrid time:", timer() - mesh_time, timer()-start_time)
-                x, y = x.reshape(-1), y.reshape(-1)
-
-                # Select the points in the mesh [X, Y] that are visible, as returned by the Hokuyo (it 
-                # returns the area that is visible, but the visualisation draws a series of points 
-                # that are within this visible area). 
- 
-                poly_time = timer()
-                path = PolygonPath(list(zip(X_rel,Y_rel)))
-                inside = path.contains_points(list(zip(x, y)))
-
-                # Plot those points. Green dots: the visible area for the Hokuyo. Red starts: the 
-                # obstacles. Red lines: the visibility range from the Hokuyo sensor. The youBot is 
-                # indicated with two dots: the blue one corresponds to the rear, the red one to the 
-                # Hokuyo sensor position. 
-                # the points inside the laser range and that are not obstacles
-                XY_inside = rel2abs(x[inside], y[inside], youbot_pos, youbot_euler[2])
-                #sensor_ax.plot(*XY_inside, '.g')
-                inside_timer = timer()
-                for i in range(len(XY_inside[0])):
-                    x = int((XY_inside[0][i]) * map_ppm - map_offset[0])
-                    y = int((XY_inside[1][i]) * map_ppm - map_offset[1])
-                    map_arr[x][y] = 255
-                #print("Inside timer", timer() - inside_timer, start_time - timer())
-            #process = multiprocessing.Process(target=print_empty_space_on_map, args=(pts, contacts, X_rel, Y_rel, map_arr))
-            #process.start()
+            pts, contacts = youbot_handler.youbot.hokuyo_read(youbot_handler.vrep, simx_opmode_buffer)
+            X_rel = [youbot_handler.youbot.hokuyo1_pos[0], *pts[0, :], youbot_handler.youbot.hokuyo2_pos[0]]
+            Y_rel = [youbot_handler.youbot.hokuyo1_pos[1], *pts[1, :], youbot_handler.youbot.hokuyo2_pos[1]]
             print_empty_space_on_map(pts, contacts, X_rel, Y_rel, map_arr)
-            sensor_ax.clear()
-            sensor_ax.plot(*rel2abs(X_rel, Y_rel, youbot_pos, youbot_euler[2]), 'r')
             # The absolut position of the different contacts points 
             XY_contacts = rel2abs(pts[0, contacts], pts[1, contacts], youbot_pos, youbot_euler[2])
             contacts_timer = timer()
@@ -215,39 +262,117 @@ if __name__ == '__main__':
                 x = int((XY_contacts[0][i]) * map_ppm - map_offset[0])
                 y = int((XY_contacts[1][i]) * map_ppm - map_offset[1])
                 map_arr[x][y] = 0
-            #print("Contacts timer", timer() - contacts_timer)
-            #np.set_printoptions(threshold=np.nan)
-            sensor_ax.plot(*XY_contacts, '*m')
 
-            # The absolute position of the bot
-            sensor_ax.plot(*rel2abs(0, 0, youbot_pos, youbot_euler[2]), 'ob')
-            # The absolute position of the bot's sensors
-            sensor_ax.plot(*rel2abs(*youbot.hokuyo1_pos[:2], youbot_pos, youbot_euler[2]), 'or')
-            sensor_ax.plot(*rel2abs(*youbot.hokuyo2_pos[:2], youbot_pos, youbot_euler[2]), 'or')
-            sensor_ax.set_xlim(-10.5, 10.5)
-            sensor_ax.set_ylim(-10.5, 10.5)
-            sensor_ax.set_aspect('equal')
-            canvas.flush_events()
-        
+        cv2.imshow('MAP', map_arr)
+        cv2.waitKey(1)
+
+        # Milestone 1:
+        if fsm == 'explore-init':
+            if not initial_rotation:
+                pos_x, pos_y = youbot_pos[:2]
+                pos_x = int(pos_x * map_ppm - map_offset[0])
+                pos_y = int(pos_y * map_ppm - map_offset[1])
+                for i in range(int(np.ceil(15/100 * map_ppm))):
+                    for j in range(int(np.ceil(15/100 * map_ppm))):
+                        map_arr[pos_x+i][pos_y+j] = 255
+                        map_arr[pos_x-i][pos_y+j] = 255
+                        map_arr[pos_x+i][pos_y-j] = 255
+                        map_arr[pos_x-i][pos_y-j] = 255
+                step = 1
+                angle_init = youbot_angle
+                initial_rotation = True
+            # Make a 360 degrees rotation to prevent to close points to be triggered
+            if step == 1:
+                youbot_handler.rotate_right_vel = 10
+                if (abs(angdiff(angle_init + np.pi, youbot_angle)) < np.deg2rad(10)):
+                    step = 2 
+            else:
+                distance_left = abs(angdiff(angle_init, youbot_angle))
+                youbot_handler.rotate_right_vel = distance_left
+                if distance_left < np.deg2rad(0.1):
+                    youbot_handler.rotate_right_vel = 0
+                    fsm = 'explore'
+
+                elif distance_left < np.deg2rad(10):
+                    youbot_handler.rotate_right_vel = angdiff(angle_init, youbot_angle)
+
+        elif fsm == 'explore':
+            p2e = point2explore(map_arr, np.asarray(youbot_pos[:2]) * map_ppm - map_offset)
+            #p2e = np.asarray(p2e) - np.asarray([2*array_side_len, 2*array_side_len])
+
+            path = path2point(youbot_pos, map_arr,p2e)
+            #path = path[0:-1:1]
+            #path = path[1:]
+            print(path)
+            size_x, size_y = map_arr.shape
+            size_x *= 2
+            size_y *= 2
+            map_show = map_arr.copy()
+            moves = []
+            for point in path:
+                map_show[point[0],point[1]] = 200
+                
+                if len(moves) == 0:
+                    prev_pos_x = youbot_pos[0]
+                    prev_pos_y = youbot_pos[1]
+                    
+                move_x = point[0]
+                move_y = point[1]
+                delta_x = (prev_pos_x - move_x)
+                delta_y = (prev_pos_y - move_y)
+                # x_rel = delta_x*np.cos(youbot_angle) + delta_y*np.sin(youbot_angle)
+                # y_rel = -delta_x*np.sin(youbot_angle) + delta_y*np.cos(youbot_angle)
+                den_norm = np.sqrt(delta_x**2+delta_y**2)
+                x_rel_norm = delta_x / den_norm
+                y_rel_norm = delta_y / den_norm
+                theta_target = np.sign(y_rel_norm) * np.arccos(x_rel_norm)
+                moves.append(('r', theta_target+np.pi))
+                (print(x_rel_norm, y_rel_norm))
+                moves.append(('f', point[0], point[1]))
+                prev_pos_x = move_x
+                prev_pos_y = move_y
+            print("Moves computed:", moves)
+            sleep(2)
+            cv2.imshow("big map", cv2.resize(map_show, (size_x, size_y)))
+            cv2.waitKey(10)
+            fsm = 'test-explo'
+            
+
         # Test the exploration by using a hardcoded path 
-        if fsm == 'test-move-init':
+        elif fsm == 'test-move-init':
             #youbot0 = youbot_pos[0]
             #euler2 = youbot_euler[2]
+            sleep(2)
             fsm = 'test-explo'
 
-        if fsm == 'test-explo':
-            cv2.imshow('RIP35', map_arr)
+        elif fsm == 'test-explo':
+            cv2.imshow('MAP', map_arr)
             cv2.waitKey(10)
             
+            print("Explo count:", explo_count, len(moves))
             move = moves[explo_count]
             print('move is', move)
             move_type = move[0]
             if move_type is 'r':
-                move_val = move[1]
-                rotate_right_vel = angdiff(move_val, youbot_angle)
+                move_val = move[1] + np.pi
+                ####
+                if explo_count > 1:
+                    move_x = moves[explo_count+1][1]
+                    move_y = moves[explo_count+1][2]
+                    delta_x = (moves[explo_count-1][1] - move_x)
+                    delta_y = (moves[explo_count-1][2] - move_y)
+                    # x_rel = delta_x*np.cos(youbot_angle) + delta_y*np.sin(youbot_angle)
+                    # y_rel = -delta_x*np.sin(youbot_angle) + delta_y*np.cos(youbot_angle)
+                    den_norm = np.sqrt(delta_x**2+delta_y**2)
+                    x_rel_norm = delta_x / den_norm
+                    y_rel_norm = delta_y / den_norm
+                    theta_target = np.sign(y_rel_norm) * np.arccos(x_rel_norm)
+                    move_val = theta_target + np.pi
+                ####
+                youbot_handler.rotate_right_vel = angdiff(move_val, youbot_angle)
                 if (abs(angdiff(move_val, youbot_angle)) < np.deg2rad(.1)) and \
                         (abs(angdiff(prev_orientation, youbot_angle)) < np.deg2rad(.01)):
-                    rotate_right_vel = 0
+                    youbot_handler.rotate_right_vel = 0
                     explo_count += 1
                     fsm = 'test-move-init'
                 prev_orientation = youbot_angle
@@ -255,6 +380,9 @@ if __name__ == '__main__':
                 print("Youbot pos", youbot_pos)
                 move_x = move[1]
                 move_y = move[2]
+                pos_x, pos_y = youbot_pos[:2]
+                youbot_pos[0] = int(youbot_pos[0] * map_ppm - map_offset[0])
+                youbot_pos[1] = int(youbot_pos[1] * map_ppm - map_offset[1])
                 delta_x = youbot_pos[0] - move_x
                 delta_y = youbot_pos[1] - move_y
                 x_rel = delta_x*np.cos(youbot_angle) + delta_y*np.sin(youbot_angle)
@@ -286,20 +414,23 @@ if __name__ == '__main__':
                 forw_sign = np.sign(x_rel)
 
                 print(forw_sign)
+                scale = 1/(2*map_ppm)
                 dist_from_target = np.sqrt((youbot_pos[0] - move_x)**2 + (youbot_pos[1] - move_y)**2)
-                forw_back_vel = forw_sign * (dist_from_target)
+                youbot_handler.forw_back_vel = forw_sign * scale * (dist_from_target)
+                print("Back vel", youbot_handler.forw_back_vel)
                 #print(forw_back_vel, youbot_pos[0])
-                if (dist_from_target < .1) and (abs(youbot_pos[0] - prev_position) < .001):
-                    forw_back_vel = 0
+                print(dist_from_target)
+                if (dist_from_target < .2 * map_ppm) and (abs(youbot_pos[0] - youbot_handler.prev_position) < .01*map_ppm):
+                    youbot_handler.forw_back_vel = 0
                     explo_count += 1
                     fsm = 'test-move-init'
-                prev_position = youbot_pos[0]
+                youbot_handler.prev_position = youbot_pos[0]
             if explo_count >= len(moves):
-                while True:
-                    pass
+                explo_count = 0
+                fsm = 'explore'
         ## Apply the state machine. 
         elif fsm == 'rotate':
-            cv2.imshow('RIP35', map_arr)
+            cv2.imshow('MAP', map_arr)
             cv2.waitKey(10)
             ## First, rotate the robot to go to one table.             
             # The rotation velocity depends on the difference between the current angle and the 
@@ -316,7 +447,7 @@ if __name__ == '__main__':
 
             prev_orientation = youbot_euler[2]
         elif fsm == 'drive':
-            cv2.imshow('RIP35', map_arr)
+            cv2.imshow('MAP', map_arr)
             cv2.waitKey(10)
             ## Then, make it move straight ahead until it reaches the table (x = 3.167 m).
             # The further the robot, the faster it drives. (Only check for the first dimension.)
@@ -492,7 +623,8 @@ if __name__ == '__main__':
             raise Exception('Unknown state %s' % fsm)
 
         # Update wheel velocities using the global values (whatever the state is). 
-        youbot.drive(vrep, forw_back_vel, right_vel, rotate_right_vel)
+        print(youbot_handler.forw_back_vel, youbot_handler.right_vel, youbot_handler.rotate_right_vel)
+        youbot_handler.youbot.drive(vrep, youbot_handler.forw_back_vel, youbot_handler.right_vel, youbot_handler.rotate_right_vel)
         # Make sure that we do not go faster than the physics simulation (each iteration must take 
         # roughly 50 ms).
         elapsed = timer() - start_time
